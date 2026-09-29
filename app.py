@@ -2,8 +2,9 @@ import streamlit as st
 import chromadb
 from openai import OpenAI
 import re
+import os
+from db_builder import build_database, DB_PATH, COLLECTION_NAME
 
-# Настройка страницы
 st.set_page_config(
     page_title="Поиск по СНиПам",
     page_icon="🏗️",
@@ -13,49 +14,82 @@ st.set_page_config(
 st.title("🏗️ Поиск по строительным нормам")
 st.markdown("Задайте вопрос — программа найдёт ответ в СП и СНиПах.")
 
-# Подключаемся к модели Qwen (ключ берётся из секретов Streamlit)
+
 @st.cache_resource
 def load_client():
     api_key = st.secrets["CLOUD_API_KEY"]
     return OpenAI(
         api_key=api_key,
-        base_url="https://foundation-models.api.cloud.ru/v1"
+        base_url="https://foundation-models.api.cloud.ru/v1",
+        timeout=300.0,
+        max_retries=2
     )
+
 
 client = load_client()
 
-# Подключаемся к векторной базе (кэшируем)
-@st.cache_resource
+
+@st.cache_resource(show_spinner=False)
 def load_collection():
-    chroma_client = chromadb.PersistentClient(path="./chroma_db")
-    return chroma_client.get_collection(name="snip_docs")
+    """
+    Загружает коллекцию. Если базы нет — собирает её автоматически.
+    """
+    need_build = not os.path.exists(DB_PATH)
+
+    if not need_build:
+        try:
+            chroma_client = chromadb.PersistentClient(path=DB_PATH)
+            chroma_client.get_collection(name=COLLECTION_NAME)
+        except Exception:
+            need_build = True
+
+    if need_build:
+        with st.spinner("🔨 Первый запуск: собираю векторную базу. Это займёт 2-5 минут..."):
+            progress_placeholder = st.empty()
+
+            def show_progress(msg):
+                progress_placeholder.info(msg)
+
+            build_database(progress_callback=show_progress)
+            progress_placeholder.success("✅ База собрана!")
+
+    chroma_client = chromadb.PersistentClient(path=DB_PATH)
+    return chroma_client.get_collection(name=COLLECTION_NAME)
+
 
 collection = load_collection()
 
-# Боковая панель с информацией
+
+@st.cache_data
+def count_sources():
+    try:
+        all_meta = collection.get(include=["metadatas"])["metadatas"]
+        sources = set(m["source"] for m in all_meta if m and "source" in m)
+        return sorted(sources)
+    except Exception:
+        return []
+
+
+sources_list = count_sources()
+
 with st.sidebar:
     st.header("📚 База знаний")
-    st.write("Загружено документов: **5**")
+    st.write(f"Загружено документов: **{len(sources_list)}**")
     st.markdown("---")
     st.markdown("**Документы:**")
-    st.write("• ГОСТ Р 51872-2024")
-    st.write("• СП 126.13330.2017")
-    st.write("• СП 46.13330.2012")
-    st.write("• СП 70.13330.2012")
-    st.write("• СП 78.13330.2012")
+    for src in sources_list:
+        st.write(f"• {src}")
 
-# Поле для вопроса
+
 question = st.text_input("Ваш вопрос:", placeholder="Например: допуски по асфальту")
 
-# Кнопка поиска
 if st.button("🔍 Найти ответ", type="primary"):
     if not question.strip():
         st.warning("Пожалуйста, введите вопрос.")
     else:
         with st.spinner("Ищу ответ в документах..."):
             candidates = []
-            
-            # 1. ВЕКТОРНЫЙ ПОИСК (30 фрагментов)
+
             vector_results = collection.query(
                 query_texts=[question],
                 n_results=30
@@ -70,9 +104,12 @@ if st.button("🔍 Найти ответ", type="primary"):
                         'tables': meta.get('tables', ''),
                         'type': 'векторный'
                     })
-            
-            # 2. ПОИСК ПО ТАБЛИЦАМ (если в вопросе есть "таблица")
-            table_matches = re.findall(r'таблиц[аы]?\s*([А-ЯA-Z]?\.?\d+(?:\.\d+)?)', question, re.IGNORECASE)
+
+            table_matches = re.findall(
+                r'таблиц[аы]?\s*([А-ЯA-Z]?\.?\d+(?:\.\d+)?)',
+                question,
+                re.IGNORECASE
+            )
             if table_matches:
                 for table_num in table_matches:
                     st.info(f"🔍 Найдено упоминание таблицы {table_num}. Ищу точное совпадение...")
@@ -93,8 +130,7 @@ if st.button("🔍 Найти ответ", type="primary"):
                                 })
                     except Exception as e:
                         st.warning(f"Ошибка поиска таблицы: {e}")
-            
-            # 3. ПОИСК ПО КЛЮЧЕВЫМ СЛОВАМ (допуск, отклонение)
+
             if re.search(r'допуск|отклонени', question, re.IGNORECASE):
                 keyword_results = collection.query(
                     query_texts=["допуск отклонение не более мм"],
@@ -110,30 +146,30 @@ if st.button("🔍 Найти ответ", type="primary"):
                             'tables': meta.get('tables', ''),
                             'type': 'ключевые слова'
                         })
-            
-            # 4. ФИЛЬТРАЦИЯ
+
             filtered = []
             for c in candidates:
                 text_lower = c['text'].lower()
                 has_number = bool(re.search(r'\d+', c['text']))
-                has_keyword = any(word in text_lower for word in ['допуск', 'отклонен', 'мм', 'таблиц', 'не более'])
+                has_keyword = any(
+                    word in text_lower
+                    for word in ['допуск', 'отклонен', 'мм', 'таблиц', 'не более']
+                )
                 if has_number and has_keyword:
                     filtered.append(c)
-            
+
             if not filtered:
                 filtered = candidates
-            
-            # Убираем дубликаты
+
             seen = set()
             unique_filtered = []
             for c in filtered:
                 if c['text'] not in seen:
                     seen.add(c['text'])
                     unique_filtered.append(c)
-            
+
             unique_filtered = unique_filtered[:25]
-            
-            # Собираем контекст и источники
+
             context = ""
             sources = []
             for c in unique_filtered:
@@ -145,13 +181,12 @@ if st.button("🔍 Найти ответ", type="primary"):
                 context += f"\n\n--- Источник: {ref} ---\n{c['text']}"
                 if ref not in sources:
                     sources.append(ref)
-            
+
             st.info(f"📖 Отобрано фрагментов: {len(unique_filtered)}")
             st.markdown("**Источники:**")
             for src in sources[:10]:
                 st.write(f"• {src}")
-            
-            # Формируем запрос к модели
+
             prompt = f"""Не размышляй. Сразу давай ответ.
 Ты — эксперт по строительным нормам и правилам.
 Отвечай подробно. Приведи ВСЕ найденные допуски и отклонения из фрагментов.
@@ -165,19 +200,20 @@ if st.button("🔍 Найти ответ", type="primary"):
 ВОПРОС:
 {question}
 """
-            
+
             try:
                 response = client.chat.completions.create(
-                    model="Qwen/Qwen3.6-35B-A3B",
+                    model="Qwen/Qwen3-30B-A3B",
                     messages=[{"role": "user", "content": prompt}],
-                    max_tokens=6000
+                    max_tokens=2000,
+                    extra_body={"enable_thinking": False}
                 )
-                
+
                 answer = response.choices[0].message.content
-                
+
                 st.success("Ответ найден!")
                 st.markdown("### 📖 Ответ:")
                 st.markdown(answer)
-                
+
             except Exception as e:
                 st.error(f"Произошла ошибка: {e}")
